@@ -1,0 +1,42 @@
+# Logs
+*.log
+*.out
+*.err
+
+# SLURM
+slurm-*.out
+
+# Genomic data
+*.fastq
+*.fastq.gz
+*.fq
+*.fq.gz
+*.bam
+*.bai
+*.cram
+*.crai
+*.vcf
+*.vcf.gz
+*.tbi
+*.gvcf
+*.gvcf.gz
+
+# Temporary files
+*.tmp
+*.temp
+*~
+
+# Python
+__pycache__/
+*.pyc
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Credentials / secrets
+*.pem
+*.key
+.env
