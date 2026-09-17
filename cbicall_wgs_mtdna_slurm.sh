@@ -10,9 +10,11 @@ set -euo pipefail
 #
 #   WGS -> CHECK_WGS -> MIT -> CHECK_MIT -> CLEANUP
 #
-# CLEANUP is reached only when all previous jobs exit successfully.
-# Before WGS BAMs are removed, the wrapper verifies that the mtDNA
-# BAM exported by WGS and its index still exist.
+# CHECK_MIT runs after the MIT job regardless of its exit status so that
+# failures compatible with very low mtDNA signal can be characterized.
+# CLEANUP is reached only when CHECK_MIT exits successfully. Before WGS
+# BAMs are removed, the wrapper verifies the exported mtDNA BAM, its
+# index, and BAM integrity with samtools quickcheck.
 #
 # Usage:
 #   ./cbicall_wgs_mtdna_slurm.sh <SAMPLE_ID> <WORKDIR_BASE> [THREADS]
@@ -78,6 +80,21 @@ EXCLUDE_NODES="${EXCLUDE_NODES:-}"
 EXCLUDE_DIRECTIVE=""
 if [[ -n "$EXCLUDE_NODES" ]]; then
     EXCLUDE_DIRECTIVE="#SBATCH --exclude=${EXCLUDE_NODES}"
+fi
+
+# Optional settings. These can be overridden in config/config.env.
+SAMTOOLS_MODULE="${SAMTOOLS_MODULE:-SAMtools}"
+MTDNA_LOW_MAPPED_READS_THRESHOLD="${MTDNA_LOW_MAPPED_READS_THRESHOLD:-1000}"
+MTDNA_LOW_COVERED_1X_PCT_THRESHOLD="${MTDNA_LOW_COVERED_1X_PCT_THRESHOLD:-50}"
+
+if ! [[ "$MTDNA_LOW_MAPPED_READS_THRESHOLD" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: MTDNA_LOW_MAPPED_READS_THRESHOLD must be a non-negative integer"
+    exit 1
+fi
+
+if ! [[ "$MTDNA_LOW_COVERED_1X_PCT_THRESHOLD" =~ ^([0-9]+([.][0-9]+)?|[.][0-9]+)$ ]]; then
+    echo "ERROR: MTDNA_LOW_COVERED_1X_PCT_THRESHOLD must be numeric"
+    exit 1
 fi
 
 SAMPLE_DIR="${WORKDIR_BASE}/${SAMPLE}"
@@ -324,6 +341,121 @@ set -euo pipefail
 
 STATUS_LOG="${STATUS_LOG}"
 
+module load "${SAMTOOLS_MODULE}"
+
+LOW_MAPPED_READS_THRESHOLD=${MTDNA_LOW_MAPPED_READS_THRESHOLD}
+LOW_COVERED_1X_PCT_THRESHOLD=${MTDNA_LOW_COVERED_1X_PCT_THRESHOLD}
+
+# Locate WGS output and exported mtDNA BAM.
+WGS_DIR=\$(find "${SAMPLE_DIR}" -maxdepth 1 \
+    -type d \
+    -name "${SAMPLE}_cbicall_bash_${WGS_SOFTWARE_STACK}_wgs_*" \
+    -printf '%T@ %p\n' 2>/dev/null | \
+    sort -nr | \
+    head -1 | \
+    cut -d' ' -f2- || true)
+
+if [[ -z "\$WGS_DIR" || ! -d "\$WGS_DIR" ]]; then
+    echo "MIT_FAIL: WGS output directory not found" >> "\$STATUS_LOG"
+    exit 1
+fi
+
+MTDNA_BAM=\$(find "\$WGS_DIR/exports/mtdna" -maxdepth 1 \
+    -type f \
+    -name "*_MIT.bam" \
+    -print -quit 2>/dev/null || true)
+
+if [[ -z "\$MTDNA_BAM" || ! -f "\$MTDNA_BAM" ]]; then
+    echo "MTDNA_BAM_CHECK: FAIL" >> "\$STATUS_LOG"
+    echo "MIT_FAIL: exported mtDNA BAM not found" >> "\$STATUS_LOG"
+    exit 1
+fi
+
+echo "MTDNA_BAM_CHECK: OK \$MTDNA_BAM" >> "\$STATUS_LOG"
+
+MTDNA_BAI="\${MTDNA_BAM}.bai"
+if [[ ! -f "\$MTDNA_BAI" ]]; then
+    echo "MTDNA_BAI_CHECK: FAIL" >> "\$STATUS_LOG"
+    echo "MIT_FAIL: exported mtDNA BAM index not found" >> "\$STATUS_LOG"
+    exit 1
+fi
+
+echo "MTDNA_BAI_CHECK: OK \$MTDNA_BAI" >> "\$STATUS_LOG"
+
+# Validate mtDNA BAM and collect coverage statistics.
+if ! command -v samtools >/dev/null 2>&1; then
+    echo "MTDNA_BAM_QUICKCHECK: NOT_RUN samtools_not_found" >> "\$STATUS_LOG"
+    echo "MIT_FAIL: samtools not available for mtDNA BAM validation" >> "\$STATUS_LOG"
+    exit 1
+fi
+
+if samtools quickcheck "\$MTDNA_BAM"; then
+    echo "MTDNA_BAM_QUICKCHECK: OK" >> "\$STATUS_LOG"
+else
+    echo "MTDNA_BAM_QUICKCHECK: FAIL" >> "\$STATUS_LOG"
+    echo "MIT_FAIL: exported mtDNA BAM failed samtools quickcheck" >> "\$STATUS_LOG"
+    exit 1
+fi
+
+if samtools idxstats "\$MTDNA_BAM" >/dev/null 2>&1; then
+    echo "MTDNA_BAI_USABLE: OK" >> "\$STATUS_LOG"
+else
+    echo "MTDNA_BAI_USABLE: FAIL" >> "\$STATUS_LOG"
+    echo "MIT_FAIL: exported mtDNA BAM index is not usable" >> "\$STATUS_LOG"
+    exit 1
+fi
+
+if ! MTDNA_TOTAL_READS=\$(samtools view -c "\$MTDNA_BAM"); then
+    echo "MIT_FAIL: unable to count mtDNA BAM reads" >> "\$STATUS_LOG"
+    exit 1
+fi
+
+if ! MTDNA_MAPPED_READS=\$(samtools view -c -F 4 "\$MTDNA_BAM"); then
+    echo "MIT_FAIL: unable to count mapped mtDNA BAM reads" >> "\$STATUS_LOG"
+    exit 1
+fi
+
+if ! DEPTH_STATS=\$(samtools depth -a -r chrM "\$MTDNA_BAM" 2>/dev/null | \
+    awk '{
+        sum += \$3
+        if (\$3 > 0) c1++
+        n++
+    }
+    END {
+        if (n > 0)
+            printf "%.4f %.4f", sum/n, 100*c1/n
+        else
+            printf "0.0000 0.0000"
+    }'); then
+    echo "MIT_FAIL: unable to calculate mtDNA coverage statistics" >> "\$STATUS_LOG"
+    exit 1
+fi
+
+read -r MTDNA_MEAN_DEPTH MTDNA_COVERED_1X_PCT <<< "\$DEPTH_STATS"
+if [[ -z "\${MTDNA_MEAN_DEPTH:-}" || -z "\${MTDNA_COVERED_1X_PCT:-}" ]]; then
+    echo "MIT_FAIL: empty mtDNA coverage statistics" >> "\$STATUS_LOG"
+    exit 1
+fi
+
+echo "MTDNA_TOTAL_READS: \$MTDNA_TOTAL_READS" >> "\$STATUS_LOG"
+echo "MTDNA_MAPPED_READS: \$MTDNA_MAPPED_READS" >> "\$STATUS_LOG"
+echo "MTDNA_MEAN_DEPTH: \$MTDNA_MEAN_DEPTH" >> "\$STATUS_LOG"
+echo "MTDNA_COVERED_1X_PCT: \$MTDNA_COVERED_1X_PCT" >> "\$STATUS_LOG"
+
+LOW_READS=0
+LOW_COVERAGE=0
+
+if (( MTDNA_MAPPED_READS < LOW_MAPPED_READS_THRESHOLD )); then
+    LOW_READS=1
+fi
+
+if awk -v value="\$MTDNA_COVERED_1X_PCT" \
+       -v threshold="\$LOW_COVERED_1X_PCT_THRESHOLD" \
+       'BEGIN { exit !(value < threshold) }'; then
+    LOW_COVERAGE=1
+fi
+
+# Locate and validate MIT output.
 MIT_DIR=\$(find "${SAMPLE_DIR}" -maxdepth 1 \
     -type d \
     -name "cbicall_bash_${MIT_SOFTWARE_STACK}_mit_single_${MIT_REFERENCE}_*" \
@@ -333,29 +465,62 @@ MIT_DIR=\$(find "${SAMPLE_DIR}" -maxdepth 1 \
     cut -d' ' -f2- || true)
 
 if [[ -z "\$MIT_DIR" || ! -d "\$MIT_DIR" ]]; then
-    echo "MIT_FAIL: output directory not found" >> "\$STATUS_LOG"
+    if (( LOW_READS == 1 && LOW_COVERAGE == 1 )); then
+        echo "MIT_FAIL_REASON: LOW_MTDNA_SIGNAL" >> "\$STATUS_LOG"
+        echo "WGS_BAM_CLEANUP_CANDIDATE: YES" >> "\$STATUS_LOG"
+        echo "MIT_FAIL: LOW_MTDNA_SIGNAL mapped_reads=\$MTDNA_MAPPED_READS mean_depth=\$MTDNA_MEAN_DEPTH covered_1x_pct=\$MTDNA_COVERED_1X_PCT; mtDNA_BAM=OK mtDNA_BAI=OK quickcheck=OK; WGS_BAM_CLEANUP_CANDIDATE=YES" >> "\$STATUS_LOG"
+    else
+        echo "MIT_FAIL: output directory not found" >> "\$STATUS_LOG"
+    fi
     exit 1
 fi
 
+MIT_LOG="\$MIT_DIR/bash_${MIT_SOFTWARE_STACK}_mit_single_${MIT_REFERENCE}.log"
 VCF="\$MIT_DIR/01_mtoolbox/VCF_file.vcf"
+
+echo "MIT_DIR: \$MIT_DIR" >> "\$STATUS_LOG"
+
+if [[ -f "\$VCF" ]] && [[ -f "\$MIT_LOG" ]] && grep -q "All done!!!" "\$MIT_LOG"; then
+    echo "MIT_VCF: \$VCF" >> "\$STATUS_LOG"
+    echo "MIT_OK" >> "\$STATUS_LOG"
+    exit 0
+fi
+
+if (( LOW_READS == 1 && LOW_COVERAGE == 1 )); then
+    echo "MIT_FAIL_REASON: LOW_MTDNA_SIGNAL" >> "\$STATUS_LOG"
+
+    if [[ -f "\$MIT_LOG" ]] && \
+       grep -q "consensus_value.*referenced before assignment" "\$MIT_LOG"; then
+        echo "MIT_FAILURE_SIGNATURE: MTOOLBOX_CONSENSUS_VALUE_ERROR" >> "\$STATUS_LOG"
+    fi
+
+    echo "WGS_BAM_CLEANUP_CANDIDATE: YES" >> "\$STATUS_LOG"
+    echo "MIT_FAIL: LOW_MTDNA_SIGNAL mapped_reads=\$MTDNA_MAPPED_READS mean_depth=\$MTDNA_MEAN_DEPTH covered_1x_pct=\$MTDNA_COVERED_1X_PCT; mtDNA_BAM=OK mtDNA_BAI=OK quickcheck=OK; WGS_BAM_CLEANUP_CANDIDATE=YES" >> "\$STATUS_LOG"
+    exit 1
+fi
+
 if [[ ! -f "\$VCF" ]]; then
     echo "MIT_FAIL: missing VCF" >> "\$STATUS_LOG"
     exit 1
 fi
 
-if ! grep -q "All done!!!" "\$MIT_DIR/bash_${MIT_SOFTWARE_STACK}_mit_single_${MIT_REFERENCE}.log"; then
+if [[ ! -f "\$MIT_LOG" ]]; then
+    echo "MIT_FAIL: MIT log not found" >> "\$STATUS_LOG"
+    exit 1
+fi
+
+if ! grep -q "All done!!!" "\$MIT_LOG"; then
     echo "MIT_FAIL: incomplete log" >> "\$STATUS_LOG"
     exit 1
 fi
 
-echo "MIT_DIR: \$MIT_DIR" >> "\$STATUS_LOG"
-echo "MIT_VCF: \$VCF" >> "\$STATUS_LOG"
-echo "MIT_OK" >> "\$STATUS_LOG"
+echo "MIT_FAIL: unknown MIT validation error" >> "\$STATUS_LOG"
+exit 1
 EOF_CHECK_MIT
 
 chmod +x "$CHECK_MIT_SCRIPT"
 
-CHECK_MIT_SBATCH=(sbatch --parsable --partition="$SHORT_PARTITION" --dependency="afterok:$JOB_MIT")
+CHECK_MIT_SBATCH=(sbatch --parsable --partition="$SHORT_PARTITION" --dependency="afterany:$JOB_MIT")
 if [[ -n "$EXCLUDE_NODES" ]]; then
     CHECK_MIT_SBATCH+=(--exclude="$EXCLUDE_NODES")
 fi
@@ -373,6 +538,8 @@ cat > "$CLEAN_SCRIPT" <<EOF_CLEANUP
 set -euo pipefail
 
 STATUS_LOG="${STATUS_LOG}"
+
+module load "${SAMTOOLS_MODULE}"
 
 WGS_DIR=\$(find "${SAMPLE_DIR}" -maxdepth 1 \
     -type d \
@@ -406,6 +573,18 @@ fi
 MTDNA_BAI="\${MTDNA_BAM}.bai"
 if [[ ! -f "\$MTDNA_BAI" ]]; then
     echo "CLEANUP_ABORTED: exported mtDNA BAM index not found" >> "\$STATUS_LOG"
+    exit 1
+fi
+
+if ! command -v samtools >/dev/null 2>&1; then
+    echo "CLEANUP_ABORTED: samtools not available for mtDNA BAM validation" >> "\$STATUS_LOG"
+    exit 1
+fi
+
+if samtools quickcheck "\$MTDNA_BAM"; then
+    echo "CLEANUP_MTDNA_QUICKCHECK: OK" >> "\$STATUS_LOG"
+else
+    echo "CLEANUP_ABORTED: exported mtDNA BAM failed samtools quickcheck" >> "\$STATUS_LOG"
     exit 1
 fi
 

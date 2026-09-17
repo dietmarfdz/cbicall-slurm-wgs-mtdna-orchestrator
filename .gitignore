@@ -40,3 +40,6 @@ Thumbs.db
 *.pem
 *.key
 .env
+
+# Local/site-specific configuration
+config/config.env
