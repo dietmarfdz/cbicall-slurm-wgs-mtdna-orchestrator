@@ -1,107 +1,104 @@
-# CBIcall Slurm WGS + mtDNA Orchestrator
+# CBIcall WGS + mtDNA Slurm Orchestrator
 
-A lightweight Slurm orchestration layer for running **CBIcall WGS and mitochondrial DNA (mtDNA) analyses in sequence**, with explicit validation checkpoints, dependency-aware execution, status logging, and safe cleanup of large intermediate WGS BAM files.
+A lightweight Slurm orchestration layer for running **CBIcall whole-genome sequencing (WGS) followed by mitochondrial DNA (mtDNA) analysis**, with explicit validation checkpoints, dependency-aware execution, failure diagnostics, status logging, batch monitoring, and conservative cleanup of large intermediate WGS BAM files.
 
-This repository does **not** replace or modify CBIcall. It is an external Bash/Slurm wrapper designed to automate repeated CBIcall executions on HPC systems.
+This repository does **not** replace or reimplement CBIcall. It is an external Bash/Slurm wrapper designed to automate repeated CBIcall executions on HPC systems.
 
-> **CBIcall** is a configuration-driven framework for reproducible variant calling in large sequencing cohorts. It supports WES, WGS and mitochondrial DNA workflows and can execute validated workflows through several backends, including Bash, Cromwell, Nextflow and Snakemake.
+> **CBIcall** is a configuration-driven framework for reproducible variant calling in large sequencing cohorts.
 
-- CBIcall repository: https://github.com/CNAG-Biomedical-Informatics/cbicall
-- CBIcall publication: https://doi.org/10.1093/bioadv/vbag232
+Official CBIcall resources:
+
+- Repository: https://github.com/CNAG-Biomedical-Informatics/cbicall
+- Documentation: https://cnag-biomedical-informatics.github.io/cbicall/
+- Publication: Rueda M, Fernandez-Orth D, Gut IG. *CBIcall: a configuration-driven framework for variant calling in large sequencing cohorts*. **Bioinformatics Advances** (2026). https://doi.org/10.1093/bioadv/vbag232
 
 ---
 
 ## Why this wrapper exists
 
-Running WGS and mtDNA analysis over many samples on an HPC cluster involves more than submitting the same command repeatedly.
+Running WGS and mtDNA analysis over many samples on an HPC cluster involves more than repeatedly submitting the same command.
 
-For each sample, this wrapper:
+For each sample, the orchestrator:
 
-1. creates the CBIcall YAML configuration for WGS;
-2. submits the WGS job through Slurm;
-3. verifies that the expected WGS outputs were actually produced;
-4. verifies that the mtDNA BAM exported from the WGS workflow exists and is indexed;
-5. launches the CBIcall mitochondrial pipeline only after the WGS validation succeeds;
-6. validates the mitochondrial output;
-7. removes large WGS BAM intermediates only after the mitochondrial analysis has been successfully validated;
-8. records job IDs, execution times and validation status in a per-sample `pipeline_status.log`.
+1. generates the CBIcall YAML configuration for WGS;
+2. submits the WGS analysis through Slurm;
+3. validates the expected WGS outputs;
+4. verifies that the mtDNA BAM exported by the WGS workflow exists and is indexed;
+5. launches the CBIcall mitochondrial workflow only after WGS validation succeeds;
+6. runs an mtDNA validation/diagnostic step even if the mitochondrial CBIcall job exits unsuccessfully;
+7. characterizes failures compatible with very low mtDNA signal;
+8. removes large WGS BAM intermediates only after mitochondrial analysis has been successfully validated;
+9. records job IDs, timestamps, durations, validation results, and mtDNA diagnostics in a per-sample `pipeline_status.log`.
 
-The main objective is therefore **safe batch automation**, rather than simply job submission.
+The main design principle is **fail safe**: cleanup must never be reached after an unsuccessful or unvalidated mitochondrial analysis.
 
 ---
 
 ## Workflow
 
 ```text
-                         ┌─────────────────────┐
-                         │    Input FASTQs     │
-                         └──────────┬──────────┘
-                                    │
-                                    v
-                         ┌─────────────────────┐
-                         │     CBIcall WGS     │
-                         │   GATK 4.6 / hg38   │
-                         └──────────┬──────────┘
-                                    │
-                                    v
-                         ┌─────────────────────┐
-                         │      CHECK_WGS      │
-                         ├─────────────────────┤
-                         │ WGS directory       │
-                         │ BAM                 │
-                         │ QC VCF              │
-                         │ exported mtDNA BAM  │
-                         │ mtDNA BAM index     │
-                         │ WGS completion log  │
-                         └──────────┬──────────┘
-                                    │
-                              validation OK
-                                    │
-                                    v
-                         ┌─────────────────────┐
-                         │     CBIcall MIT     │
-                         │ MToolBox / mtDNA    │
-                         └──────────┬──────────┘
-                                    │
-                                    v
-                         ┌─────────────────────┐
-                         │      CHECK_MIT      │
-                         ├─────────────────────┤
-                         │ MIT directory       │
-                         │ VCF_file.vcf        │
-                         │ MIT completion log  │
-                         └──────────┬──────────┘
-                                    │
-                              validation OK
-                                    │
-                                    v
-                         ┌─────────────────────┐
-                         │       CLEANUP       │
-                         ├─────────────────────┤
-                         │ re-check mtDNA BAM  │
-                         │ re-check BAM index  │
-                         │ delete WGS BAMs     │
-                         │ preserve mtDNA BAM  │
-                         └─────────────────────┘
+               CBIcall WGS
+                    |
+                    | afterok
+                    v
+               CHECK_WGS
+                    |
+                    | validates:
+                    | - WGS output directory
+                    | - WGS BAM
+                    | - QC VCF
+                    | - exported mtDNA BAM
+                    | - mtDNA BAM index
+                    | - successful WGS log marker
+                    v
+               CBIcall MIT
+                    |
+                    | afterany
+                    v
+               CHECK_MIT
+                    |
+                    | validates/records:
+                    | - exported mtDNA BAM
+                    | - BAM index
+                    | - samtools quickcheck
+                    | - usable BAM index
+                    | - total/mapped reads
+                    | - mean depth
+                    | - % chrM covered >=1x
+                    | - MIT output / VCF / completion log
+                    | - low-mtDNA-signal failure class
+                    v
+           success only (afterok)
+                    |
+                    v
+                 CLEANUP
+                    |
+                    | re-validates:
+                    | - exported mtDNA BAM
+                    | - BAM index
+                    | - samtools quickcheck
+                    v
+        remove WGS 01_bam/*.bam and *.bai
+        preserve exports/mtdna/*_MIT.bam(.bai)
 ```
 
-Slurm dependencies are used so that a downstream step is submitted only with an `afterok` dependency on the preceding step.
-
-In simplified form:
+The Slurm dependency chain is therefore:
 
 ```text
 WGS
  └── afterok → CHECK_WGS
                  └── afterok → MIT
-                                └── afterok → CHECK_MIT
-                                               └── afterok → CLEANUP
+                                └── afterany → CHECK_MIT
+                                                └── afterok → CLEANUP
 ```
 
-If a job or validation step fails, the downstream chain does not proceed.
+The `afterany` dependency for `CHECK_MIT` is intentional. It allows the validator to inspect the exported mitochondrial BAM and characterize certain mitochondrial failures instead of leaving only a generic failed Slurm job.
+
+`CLEANUP` still depends on `CHECK_MIT` with `afterok`, so a failed mitochondrial validation **does not delete the WGS BAMs**.
 
 ---
 
-## Repository structure
+## Repository layout
 
 ```text
 cbicall-slurm-wgs-mtdna-orchestrator/
@@ -113,23 +110,29 @@ cbicall-slurm-wgs-mtdna-orchestrator/
 ├── run_batch.sh
 ├── config/
 │   └── config.example.env
-└── examples/
-    └── samples.example.txt
+└── tools/
+    └── summarize_pipeline_status.sh
 ```
 
 ### Main files
 
 **`cbicall_wgs_mtdna_slurm.sh`**  
-Main per-sample orchestrator. It creates the CBIcall YAML files, generates the Slurm jobs and check scripts, and submits the full dependency chain.
-
-**`config/config.example.env`**  
-Example cluster configuration. Copy this file to `config/config.env` and adapt it to the local HPC environment.
+Main per-sample orchestrator. It creates the CBIcall YAML files, generates the Slurm jobs and validation scripts, and submits the full dependency chain.
 
 **`run_batch.sh`**  
-Convenience launcher for processing multiple sample IDs from a text file.
+Batch launcher. It reads a text file containing one sample ID per line and submits one independent orchestrator chain per sample.
 
-**`examples/samples.example.txt`**  
-Example input list containing one sample ID per line.
+**`config/config.example.env`**  
+Public example configuration. Copy it to `config/config.env` and adapt the values to the local HPC environment.
+
+**`tools/summarize_pipeline_status.sh`**  
+Batch monitoring and diagnostics utility. It scans the per-sample `pipeline_status.log` files, reports the current state of each pipeline, retrieves Slurm job states/reasons, and summarizes mtDNA validation metrics.
+
+**`CITATION.md`**  
+Citation information for this repository and the underlying CBIcall software.
+
+**`LICENSE`**  
+Repository license.
 
 ---
 
@@ -137,36 +140,34 @@ Example input list containing one sample ID per line.
 
 ### Software
 
-The wrapper assumes that the following are available:
+The orchestrator assumes the following are available:
 
-- Bash
-- Slurm (`sbatch`, `sacct`)
-- CBIcall
-- a CBIcall-compatible Python environment
-- the software/resources required by the selected CBIcall workflows
+- Linux / Bash;
+- Slurm (`sbatch`, `squeue`, `sacct`);
+- CBIcall;
+- a CBIcall-compatible Python environment;
+- SAMtools;
+- the resources and software required by the selected CBIcall WGS and mitochondrial workflows.
 
 CBIcall itself must be installed and configured independently.
 
-See the official documentation:
-
-https://github.com/CNAG-Biomedical-Informatics/cbicall
-
 ### HPC environment
 
-The script was designed for a Slurm-based HPC system and assumes that:
+The scripts assume that:
 
-- compute partitions are available for WGS and mtDNA jobs;
+- compute partitions are available for long WGS jobs and shorter validation/mtDNA jobs;
 - CBIcall can be executed from compute nodes;
-- the sample directories are visible from the nodes;
-- the relevant CBIcall reference/resource bundles are already installed.
+- sample directories are visible from the compute nodes;
+- the required CBIcall reference/resource bundles are already installed;
+- Slurm accounting is available through `sacct`.
 
-Partition names, memory, walltime, excluded nodes, Python modules and CBIcall paths are **site-specific** and must be configured locally.
+Partition names, runtime profiles, memory, walltime, excluded nodes, module names, Python paths, and CBIcall installation paths are **site-specific**.
 
 ---
 
 ## Configuration
 
-Create a local configuration file:
+Create the private local configuration from the public example:
 
 ```bash
 cp config/config.example.env config/config.env
@@ -178,60 +179,146 @@ Then edit:
 config/config.env
 ```
 
-Typical parameters include:
+The current example configuration contains:
 
 ```bash
+# CBIcall executable and Python environment
 CBICALL="/path/to/cbicall/bin/cbicall"
 CBICALL_PYTHON_PREFIX="/path/to/cbicall/python/environment"
 
-PYTHON_MODULE="Python/<version>"
-CBICALL_RUNTIME_PROFILE="<runtime-profile>"
+# Environment/module
+PYTHON_MODULE="Python/X.Y.Z"
+PYTHON_SITE_PACKAGES_REL="lib/pythonX.Y/site-packages"
+SAMTOOLS_MODULE="SAMtools"
 
-WGS_PARTITION="<wgs-partition>"
-MIT_PARTITION="<mit-partition>"
+# Site-specific settings
+RUNTIME_PROFILE="XXX"
+WGS_PARTITION="XXX"
+SHORT_PARTITION="XXX"
+EXCLUDE_NODES=""
 
+MEM="24G"
 WGS_TIME="20-00:00:00"
 MIT_TIME="10:00:00"
 
-MEM="24G"
+# CBIcall WGS settings
+CBICALL_RESOURCE="cbicall-germline-resources-v1"
+GENOME="hg38"
+WGS_SOFTWARE_STACK="gatk-4.6"
 
-EXCLUDE_NODES=""
+# CBIcall MIT settings
+MIT_SOFTWARE_STACK="gatk-3.5"
+MIT_REFERENCE="rsrs"
+
+# mtDNA low-signal thresholds
+MTDNA_LOW_MAPPED_READS_THRESHOLD="1000"
+MTDNA_LOW_COVERED_1X_PCT_THRESHOLD="50"
 ```
 
-Do **not** commit a private `config.env` containing institutional paths or infrastructure details.
+`config/config.env` must remain local and should **not** be committed. The repository `.gitignore` excludes it.
 
-The repository `.gitignore` is intended to exclude this file.
+A different configuration file can be supplied through:
+
+```bash
+export CBICALL_ORCHESTRATOR_CONFIG=/path/to/another/config.env
+```
+
+The orchestrator uses the following defaults if the optional settings are not specified:
+
+```text
+SAMTOOLS_MODULE=SAMtools
+MTDNA_LOW_MAPPED_READS_THRESHOLD=1000
+MTDNA_LOW_COVERED_1X_PCT_THRESHOLD=50
+```
 
 ---
 
-## Expected input layout
+## Input layout
 
-Each sample is expected to have its own directory below a common working directory.
-
-For example:
+Each sample is expected to have its own directory below a common working directory:
 
 ```text
 WORKDIR_BASE/
 ├── SAMPLE001/
-│   ├── SAMPLE001_L001_R1_001.fastq.gz
-│   └── SAMPLE001_L001_R2_001.fastq.gz
+│   ├── SAMPLE001_R1.fastq.gz
+│   └── SAMPLE001_R2.fastq.gz
 ├── SAMPLE002/
-│   ├── SAMPLE002_L001_R1_001.fastq.gz
-│   └── SAMPLE002_L001_R2_001.fastq.gz
+│   ├── SAMPLE002_R1.fastq.gz
+│   └── SAMPLE002_R2.fastq.gz
 └── SAMPLE003/
-    ├── SAMPLE003_L001_R1_001.fastq.gz
-    └── SAMPLE003_L001_R2_001.fastq.gz
+    ├── SAMPLE003_R1.fastq.gz
+    └── SAMPLE003_R2.fastq.gz
 ```
 
 The exact FASTQ naming requirements are ultimately determined by CBIcall.
 
-The wrapper does not recursively search arbitrary subdirectories for input FASTQs.
+---
+
+## Running one sample
+
+General syntax:
+
+```bash
+./cbicall_wgs_mtdna_slurm.sh <SAMPLE_ID> <WORKDIR_BASE> [THREADS]
+```
+
+Example:
+
+```bash
+./cbicall_wgs_mtdna_slurm.sh SAMPLE001 /path/to/WGS 4
+```
+
+Arguments:
+
+```text
+1. SAMPLE_ID      Sample directory / identifier
+2. WORKDIR_BASE   Parent directory containing the sample directory
+3. THREADS        Optional; default = 4
+```
+
+The orchestrator immediately submits the complete dependency chain. Slurm then controls when each job actually starts.
 
 ---
 
-## WGS configuration generated by the wrapper
+## Running multiple samples
 
-The orchestrator creates a per-sample WGS YAML equivalent to:
+Create a text file containing one sample ID per line:
+
+```text
+SAMPLE001
+SAMPLE002
+SAMPLE003
+```
+
+Empty lines and lines beginning with `#` are ignored by the batch launcher.
+
+Run:
+
+```bash
+./run_batch.sh <SAMPLE_LIST> <WORKDIR_BASE> [THREADS]
+```
+
+For example:
+
+```bash
+./run_batch.sh samples.txt /path/to/WGS 8
+```
+
+`run_batch.sh` submits one independent orchestrator chain per sample and writes a timestamped batch log:
+
+```text
+run_batch_YYYYMMDD_HHMMSS.log
+```
+
+The log records successful submissions, failed submissions, and orchestrator exit codes.
+
+Submitting multiple samples does not mean that all WGS jobs start simultaneously. Slurm schedules them according to resources, priorities, quotas, and cluster policy.
+
+---
+
+## WGS configuration generated by the orchestrator
+
+For each sample, the orchestrator creates a CBIcall WGS YAML equivalent to:
 
 ```yaml
 mode: single
@@ -246,20 +333,46 @@ cleanup_bam: false
 export_mtdna_bam: true
 ```
 
-Two options are particularly important for the orchestration logic:
+Two parameters are especially important:
 
 ```yaml
 cleanup_bam: false
 export_mtdna_bam: true
 ```
 
-`cleanup_bam: false` prevents the WGS pipeline from deleting BAM files before the downstream checks and mtDNA analysis are complete.
-
-`export_mtdna_bam: true` instructs CBIcall to export the mitochondrial input BAM that will subsequently be consumed by the mitochondrial workflow.
+- `cleanup_bam: false` prevents the WGS workflow from deleting BAM files before downstream validation and mtDNA analysis are complete.
+- `export_mtdna_bam: true` instructs CBIcall to export the mitochondrial BAM under `exports/mtdna/`.
 
 ---
 
-## mtDNA configuration generated by the wrapper
+## WGS validation (`CHECK_WGS`)
+
+After the WGS Slurm job completes successfully, `CHECK_WGS` locates the most recent matching WGS output directory.
+
+It verifies:
+
+```text
+WGS output directory
+01_bam/*.bam
+02_varcall/*.hc.QC.vcf.gz
+exports/mtdna/*_MIT.bam
+exports/mtdna/*_MIT.bam.bai
+successful WGS completion marker
+```
+
+A successful validation records:
+
+```text
+WGS_DIR: ...
+WGS_MTDNA_BAM: ...
+WGS_OK
+```
+
+If any required output is missing, `CHECK_WGS` exits with a non-zero status and the mitochondrial analysis is not started.
+
+---
+
+## Mitochondrial analysis
 
 The mitochondrial YAML is equivalent to:
 
@@ -270,358 +383,398 @@ workflow_backend: bash
 input_dir: /path/to/sample
 ```
 
-The mtDNA job is submitted only after `CHECK_WGS` finishes successfully.
+The mitochondrial CBIcall job is submitted only after successful WGS validation.
 
 ---
 
-## WGS validation
+## Mitochondrial validation and diagnostics (`CHECK_MIT`)
 
-After CBIcall WGS completes, `CHECK_WGS` locates the most recent WGS output directory matching the expected CBIcall naming convention.
+`CHECK_MIT` runs after the mitochondrial CBIcall job with an `afterany` dependency.
 
-It verifies:
+This is different from a normal strict `afterok` validation step: the checker also runs when the MIT job itself fails so that the failure can be characterized.
+
+### mtDNA BAM validation
+
+The checker locates the mtDNA BAM previously exported by WGS and verifies:
 
 ```text
-WGS output directory
-01_bam/*.bam
-02_varcall/*.hc.QC.vcf.gz
-exports/mtdna/*_MIT.bam
-exports/mtdna/*_MIT.bam.bai
-WGS completion message in the CBIcall log
+mtDNA BAM exists
+mtDNA BAM index exists
+samtools quickcheck succeeds
+samtools idxstats can use the index
 ```
 
-The mtDNA export check is important because a WGS workflow can otherwise complete upstream processing without providing a usable mitochondrial input for the next stage.
-
-If all checks succeed:
+It records:
 
 ```text
-WGS_MTDNA_BAM: /path/to/.../exports/mtdna/SAMPLE-DNA_MIT.bam
-WGS_OK
+MTDNA_BAM_CHECK
+MTDNA_BAI_CHECK
+MTDNA_BAI_USABLE
+MTDNA_BAM_QUICKCHECK
 ```
 
-is added to `pipeline_status.log`.
+### mtDNA signal metrics
 
-If any required output is missing, the check exits with a non-zero status and the MIT job does not run.
-
----
-
-## Mitochondrial validation
-
-After the mitochondrial CBIcall workflow completes, `CHECK_MIT` locates its output directory and verifies:
+The checker calculates:
 
 ```text
-cbicall_bash_gatk-3.5_mit_single_rsrs_<run-id>/
-└── 01_mtoolbox/
-    └── VCF_file.vcf
+MTDNA_TOTAL_READS
+MTDNA_MAPPED_READS
+MTDNA_MEAN_DEPTH
+MTDNA_COVERED_1X_PCT
 ```
 
-It also checks the CBIcall mitochondrial completion log.
+`MTDNA_COVERED_1X_PCT` is the percentage of `chrM` positions covered at least once.
 
-Successful validation records:
+### Low mtDNA signal classification
+
+A failure is classified as:
 
 ```text
-MIT_DIR: /path/to/cbicall_bash_gatk-3.5_mit_single_rsrs_<run-id>
-MIT_VCF: /path/to/cbicall_bash_gatk-3.5_mit_single_rsrs_<run-id>/01_mtoolbox/VCF_file.vcf
+MIT_FAIL_REASON: LOW_MTDNA_SIGNAL
+```
+
+only when **both** conditions are met:
+
+```text
+MTDNA_MAPPED_READS < MTDNA_LOW_MAPPED_READS_THRESHOLD
+AND
+MTDNA_COVERED_1X_PCT < MTDNA_LOW_COVERED_1X_PCT_THRESHOLD
+```
+
+With the example configuration:
+
+```text
+mapped reads < 1000
+AND
+chrM coverage >=1x < 50%
+```
+
+This is an **operational failure classification used by the orchestrator**, not a biological or clinical QC threshold.
+
+When the low-signal condition is met and the exported BAM, index, and BAM integrity checks are valid, the status log also records:
+
+```text
+WGS_BAM_CLEANUP_CANDIDATE: YES
+```
+
+This flag is informational only. The current orchestrator does **not** automatically delete the WGS BAM when MIT fails.
+
+If the mitochondrial log contains the known MToolBox signature:
+
+```text
+consensus_value ... referenced before assignment
+```
+
+the checker additionally records:
+
+```text
+MIT_FAILURE_SIGNATURE: MTOOLBOX_CONSENSUS_VALUE_ERROR
+```
+
+### Successful mitochondrial validation
+
+A normal successful run still requires the expected mitochondrial output, VCF, and completion log:
+
+```text
+MIT_DIR: ...
+MIT_VCF: ...
 MIT_OK
 ```
 
+Only a successful `CHECK_MIT` allows the cleanup stage to run.
+
 ---
 
-## Safe cleanup strategy
+## Safe cleanup
 
-WGS BAMs can occupy substantial disk space.
+WGS BAMs can occupy substantial disk space. Cleanup is therefore deliberately conservative.
 
-The wrapper therefore performs cleanup only after:
+`CLEANUP` runs only after:
 
 ```text
 WGS completed
       +
 CHECK_WGS passed
       +
-MIT completed
+MIT completed successfully
       +
 CHECK_MIT passed
 ```
 
-Immediately before deleting anything, the cleanup script **again checks** that the exported mitochondrial BAM and its index exist.
-
-Only then are the BAM/BAM-index files under the WGS `01_bam/` directory removed.
-
-Conceptually:
-
-```bash
-rm -f "$BAM_DIR"/*.bam
-rm -f "$BAM_DIR"/*.bai
-```
-
-The mitochondrial export is **not** removed:
+Immediately before deleting WGS BAMs, the cleanup script verifies again that:
 
 ```text
-WGS_OUTPUT/
-└── exports/
-    └── mtdna/
-        ├── SAMPLE-DNA_MIT.bam
-        └── SAMPLE-DNA_MIT.bam.bai
+exported mtDNA BAM exists
+exported mtDNA BAM index exists
+samtools quickcheck succeeds
 ```
 
-Successful cleanup is recorded as:
+Only then are the WGS BAM/BAM-index files removed:
 
 ```text
-CLEANUP_MTDNA_PRESERVED: /path/to/.../SAMPLE-DNA_MIT.bam
+WGS_OUTPUT/01_bam/*.bam
+WGS_OUTPUT/01_bam/*.bai
+```
+
+The exported mitochondrial files are preserved.
+
+Successful cleanup records:
+
+```text
+CLEANUP_MTDNA_QUICKCHECK: OK
+CLEANUP_MTDNA_PRESERVED: ...
 CLEANUP_OK
 ```
 
-This conservative design is intentional: a validation failure should consume extra storage rather than risk deleting a BAM that may still be needed.
+A validation failure should consume additional storage rather than risk deleting a BAM that may still be required.
 
 ---
 
-## Running one sample
+## `pipeline_status.log`
 
-General syntax:
+Each sample receives a persistent status log.
 
-```bash
-./cbicall_wgs_mtdna_slurm.sh <SAMPLE_ID> <WORKDIR_BASE> [THREADS]
-```
-
-For example:
-
-```bash
-./cbicall_wgs_mtdna_slurm.sh SAMPLE001 /path/to/WGS 4
-```
-
-If the number of threads is omitted, the configured/default value is used.
-
-The script immediately submits the complete dependency chain to Slurm.
-
----
-
-## Running multiple samples
-
-Create a text file containing one sample ID per line:
+A successful run contains entries conceptually similar to:
 
 ```text
-SAMPLE001
-SAMPLE002
-SAMPLE003
-```
-
-Then use the batch launcher:
-
-```bash
-./run_batch.sh samples.txt /path/to/WGS 4
-```
-
-Alternatively:
-
-```bash
-while IFS= read -r SAMPLE; do
-    [[ -z "$SAMPLE" ]] && continue
-
-    ./cbicall_wgs_mtdna_slurm.sh \
-        "$SAMPLE" \
-        /path/to/WGS \
-        4
-
-done < samples.txt
-```
-
-Each sample gets an independent Slurm dependency chain.
-
-Submitting many samples does not imply that all WGS jobs execute simultaneously; Slurm controls actual scheduling according to cluster resources, priorities and configured limits.
-
----
-
-## Monitoring
-
-### Slurm queue
-
-```bash
-squeue -u "$USER"
-```
-
-### Accounting information
-
-```bash
-sacct -j <JOB_ID> \
-    --format=JobID,JobName,State,ExitCode,Elapsed,TotalCPU,AllocCPUS,MaxRSS,NodeList
-```
-
-### Pipeline status
-
-Each sample contains:
-
-```text
-pipeline_status.log
-```
-
-A successful run will contain entries similar to:
-
-```text
+===== DATE =====
 START SAMPLE: SAMPLE001
 THREADS: 4
 
-WGS_JOB: 123456
-CHECK_WGS_JOB: 123457
-MIT_JOB: 123458
-CHECK_MIT_JOB: 123459
-CLEANUP_JOB: 123460
+WGS_JOB: <job-id>
+CHECK_WGS_JOB: <job-id>
+MIT_JOB: <job-id>
+CHECK_MIT_JOB: <job-id>
+CLEANUP_JOB: <job-id>
 
 PIPELINE_LAUNCHED_OK
 
 WGS_REAL_START: ...
 WGS_REAL_END: ...
 WGS_DURATION_SECONDS: ...
-
-WGS_MTDNA_BAM: /path/to/.../SAMPLE001-DNA_MIT.bam
+WGS_DIR: ...
+WGS_MTDNA_BAM: ...
 WGS_OK
 
 MIT_REAL_START: ...
 MIT_REAL_END: ...
 MIT_DURATION_SECONDS: ...
 
-MIT_DIR: /path/to/.../cbicall_bash_gatk-3.5_mit_single_rsrs_<run-id>
-MIT_VCF: /path/to/.../01_mtoolbox/VCF_file.vcf
+MTDNA_BAM_CHECK: OK ...
+MTDNA_BAI_CHECK: OK ...
+MTDNA_BAI_USABLE: OK
+MTDNA_BAM_QUICKCHECK: OK
+MTDNA_TOTAL_READS: ...
+MTDNA_MAPPED_READS: ...
+MTDNA_MEAN_DEPTH: ...
+MTDNA_COVERED_1X_PCT: ...
+
+MIT_DIR: ...
+MIT_VCF: ...
 MIT_OK
 
-CLEANUP_MTDNA_PRESERVED: /path/to/.../SAMPLE001-DNA_MIT.bam
+CLEANUP_MTDNA_QUICKCHECK: OK
+CLEANUP_MTDNA_PRESERVED: ...
 CLEANUP_OK
 ```
 
-The `WGS_SACCT` or `MIT_SACCT` fields may occasionally be empty if Slurm accounting information is not yet available when queried. Output validation is therefore deliberately based on the expected files and CBIcall completion logs rather than on `sacct` alone.
+If a sample has been launched more than once, additional run blocks are appended to the same file.
+
+---
+
+## Batch status summarizer
+
+The repository includes:
+
+```text
+tools/summarize_pipeline_status.sh
+```
+
+This utility provides a cohort-level view of a batch launched with the orchestrator.
+
+### What it does
+
+The script:
+
+- recursively finds `pipeline_status.log` files below the current directory;
+- analyzes only the **most recent run** in each status log;
+- retrieves the WGS, CHECK_WGS, MIT, CHECK_MIT, and CLEANUP job IDs;
+- queries `squeue` for currently active/pending jobs and their reasons;
+- falls back to `sacct` for jobs no longer present in the queue;
+- identifies Slurm failures;
+- detects failures already recorded by the orchestrator validation steps;
+- distinguishes `FAIL_MIT_LOW_SIGNAL` from other mitochondrial failures;
+- extracts mtDNA BAM validation results and signal metrics;
+- reports the current stage for samples that are still processing.
+
+### Running the summarizer
+
+Run it from the directory containing the individual sample directories:
+
+```bash
+cd /path/to/WORKDIR_BASE
+/path/to/cbicall-slurm-wgs-mtdna-orchestrator/tools/summarize_pipeline_status.sh
+```
+
+### Generated outputs
+
+The summarizer creates:
+
+```text
+paths_pipeline_status_logs
+pipeline_status_summary.log
+jobs_by_sample.tsv
+```
+
+#### `pipeline_status_summary.log`
+
+Provides global counts and one status row per sample.
+
+Possible classifications include:
+
+```text
+OK
+PROCESSING
+FAIL_WGS
+FAIL_WGS_CHECK
+FAIL_MIT
+FAIL_MIT_CHECK
+FAIL_MIT_LOW_SIGNAL
+FAIL_CLEANUP
+```
+
+For samples still running, the detail field may indicate:
+
+```text
+queued_waiting_for_WGS
+running_WGS
+waiting_for_MIT
+running_MIT
+waiting_or_running_CLEANUP
+```
+
+#### `jobs_by_sample.tsv`
+
+Provides a tab-separated table containing:
+
+- sample ID;
+- job IDs for WGS, CHECK_WGS, MIT, CHECK_MIT, and CLEANUP;
+- Slurm state and reason for each job;
+- mtDNA BAM/BAI validation status;
+- BAM quickcheck status;
+- mapped mtDNA reads;
+- mean mtDNA depth;
+- percentage of `chrM` covered at least 1x;
+- MIT failure reason;
+- `WGS_BAM_CLEANUP_CANDIDATE`.
+
+Recommended viewing:
+
+```bash
+column -t -s $'\t' pipeline_status_summary.log | less -S
+```
+
+```bash
+column -t -s $'\t' jobs_by_sample.tsv | less -S
+```
+
+---
+
+## Manual Slurm monitoring
+
+Current jobs:
+
+```bash
+squeue -u "$USER"
+```
+
+Inspect an individual job:
+
+```bash
+sacct -j <JOB_ID> \
+    --format=JobID,JobName,State,ExitCode,Elapsed,TotalCPU,AllocCPUS,MaxRSS,NodeList
+```
+
+The batch summarizer is intended to avoid repeatedly running these commands manually for every sample.
 
 ---
 
 ## Failure behaviour
 
-The dependency chain is intentionally strict.
+### WGS job or WGS validation fails
 
-### WGS job fails
+The mitochondrial workflow is not started and no cleanup occurs.
 
-```text
-WGS → FAILED
-CHECK_WGS → DependencyNeverSatisfied
-MIT → pending dependency
-CHECK_MIT → pending dependency
-CLEANUP → pending dependency
-```
+### MIT job fails
 
-No cleanup occurs.
-
-### WGS finishes but validation fails
-
-For example:
+`CHECK_MIT` still runs because it uses:
 
 ```text
-WGS_FAIL: missing exported mtDNA BAM
+afterany:<MIT_JOB>
 ```
 
-MIT is not executed.
+The checker attempts to validate the exported mtDNA BAM and characterize the failure.
 
-### MIT finishes but validation fails
-
-For example:
+If the failure is compatible with very low mitochondrial signal, it records:
 
 ```text
-MIT_FAIL: output directory not found
+MIT_FAIL_REASON: LOW_MTDNA_SIGNAL
+WGS_BAM_CLEANUP_CANDIDATE: YES
 ```
 
-Cleanup is not executed and the WGS BAM files are preserved.
+`CHECK_MIT` exits unsuccessfully, so cleanup is not executed.
 
-This is intentional.
+### MIT validation fails for another reason
+
+The checker records the corresponding `MIT_FAIL` message and exits non-zero.
+
+Cleanup is not executed.
+
+### Cleanup validation fails
+
+If the exported mtDNA BAM/index cannot be validated immediately before deletion, cleanup aborts and WGS BAMs are preserved.
 
 ---
 
-## Troubleshooting
+## Important implementation notes
 
-### `DependencyNeverSatisfied`
+### Slurm dependencies
 
-This normally means that a preceding job in the Slurm dependency chain did not exit successfully.
+The dependency types are intentionally asymmetric:
 
-Inspect:
+```text
+WGS       -> CHECK_WGS : afterok
+CHECK_WGS -> MIT       : afterok
+MIT       -> CHECK_MIT : afterany
+CHECK_MIT -> CLEANUP   : afterok
+```
+
+This allows diagnostic inspection of a failed MIT job without weakening cleanup safety.
+
+### CBIcall is executed directly inside the Slurm allocation
+
+The generated jobs execute:
 
 ```bash
-sacct -j <JOB_ID> --format=JobID,State,ExitCode,Elapsed,NodeList
+"$CBICALL" run ...
 ```
 
-and the corresponding Slurm `.out` and `.err` files.
+rather than starting an additional nested `srun` job step.
 
-### WGS reports no mitochondrial alignments
+### Output-directory discovery
 
-If CBIcall reports something similar to:
+CBIcall output directories include run-specific suffixes. The validation scripts use `find`, modification time, and sorting to select the most recent directory matching the expected CBIcall naming pattern.
 
-```text
-Exported mtDNA BAM contains no alignments for contig 'chrM'
-```
+### Slurm accounting
 
-first verify the WGS BAM:
+The orchestrator records `sacct` information when available. Depending on accounting update timing, those fields can occasionally be empty even when a job completed correctly.
 
-```bash
-samtools idxstats sample.bam | awk '$1=="chrM"'
-samtools view -c sample.bam chrM
-```
-
-If testing with subsampled FASTQs, also verify that the FASTQ records were not corrupted during subsampling.
-
-A valid FASTQ record must remain:
-
-```text
-@read-header
-SEQUENCE
-+
-QUALITY
-```
-
-When flattening FASTQ records with `paste`, remember that FASTQ headers may contain spaces. If AWK is used to reconstruct records, a tab-only field separator such as:
-
-```bash
-awk -F '\t'
-```
-
-may be necessary to avoid splitting headers into multiple fields.
-
-### MIT completed but `CHECK_MIT` reports no directory
-
-Check whether the CBIcall output naming convention has changed.
-
-The current wrapper expects a directory matching:
-
-```text
-cbicall_bash_gatk-3.5_mit_single_rsrs_*
-```
-
-and a log named:
-
-```text
-bash_gatk-3.5_mit_single_rsrs.log
-```
-
-CBIcall naming conventions may change between releases, so these patterns should be reviewed after upgrading CBIcall.
+Pipeline validity is therefore determined by explicit output checks and CBIcall completion logs rather than by `sacct` alone.
 
 ---
 
-## Important assumptions and version sensitivity
-
-This wrapper depends on several CBIcall output conventions, including directory names, log names and expected output filenames.
-
-It was developed and tested against the CBIcall workflow conventions available at the time of development.
-
-Before using it with a newer CBIcall version, review at least:
-
-```text
-WGS output directory pattern
-MIT output directory pattern
-WGS log filename
-MIT log filename
-QC VCF filename
-mtDNA exported BAM location
-MIT VCF location
-completion messages used by the checks
-```
-
-The wrapper should therefore be considered an **orchestration template that must be validated against the local CBIcall installation and HPC environment**.
-
----
-
-## Data and security considerations
+## Data and privacy
 
 This repository is intended to contain **code only**.
 
@@ -629,47 +782,62 @@ Do not commit:
 
 - FASTQ files;
 - BAM/CRAM files;
-- VCF files containing individual-level genomic data;
+- VCF/gVCF files containing individual-level genomic data;
 - sample metadata containing protected information;
 - Slurm logs containing sensitive paths or identifiers;
-- institutional credentials;
+- credentials, keys, or tokens;
 - private HPC paths;
-- private environment configuration.
+- private site-specific configuration.
 
-Review the repository before every public push:
+The repository `.gitignore` excludes common genomic data types, logs, temporary files, credentials, and:
+
+```text
+config/config.env
+```
+
+Before every public push, inspect:
 
 ```bash
 git status
 git diff --cached
 ```
 
-For an additional check:
+---
 
-```bash
-git grep -n "/private/path"
-git grep -n "scratch"
-```
+## Compatibility and maintenance
 
-Adapt these searches to the local infrastructure.
+The orchestrator intentionally validates specific CBIcall output names. This makes failures explicit, but it also means that **CBIcall version changes can require updates to the wrapper**.
+
+When upgrading CBIcall, review at least:
+
+1. WGS output-directory naming;
+2. WGS log filename and successful-completion marker;
+3. QC VCF location/name;
+4. `exports/mtdna/` naming;
+5. mtDNA output-directory naming;
+6. mtDNA log filename and completion marker;
+7. `01_mtoolbox/VCF_file.vcf` location;
+8. exported mtDNA BAM/index naming.
+
+Always validate a known sample before submitting a large cohort.
 
 ---
 
 ## Relationship to CBIcall
 
-This repository is an independent orchestration wrapper built around CBIcall.
-
-It is **not an official CBIcall component** and is not intended to duplicate the workflow implementation provided by CBIcall itself.
+This repository is an independent orchestration and monitoring layer built around CBIcall.
 
 CBIcall performs the genomic analyses. This repository adds:
 
 - Slurm dependency orchestration;
-- per-stage output checks;
+- per-stage output validation;
 - WGS-to-mtDNA chaining;
+- mtDNA failure diagnostics;
 - centralized per-sample status logging;
-- defensive cleanup of large intermediate WGS BAMs;
-- convenience support for batch execution.
+- batch-level pipeline monitoring;
+- conservative cleanup of large WGS BAM intermediates.
 
-For CBIcall installation, workflow implementation, supported configurations and authoritative documentation, refer to the upstream project:
+For authoritative information about CBIcall installation, workflows, configuration, and supported backends, refer to the upstream project:
 
 https://github.com/CNAG-Biomedical-Informatics/cbicall
 
@@ -677,11 +845,11 @@ https://github.com/CNAG-Biomedical-Informatics/cbicall
 
 ## Citation
 
-If this wrapper is used together with CBIcall, please cite the CBIcall publication:
+Citation information for this repository is provided in [`CITATION.md`](CITATION.md).
 
-> Rueda M, Fernandez-Orth D, et al. **CBIcall: a configuration-driven framework for variant calling in large sequencing cohorts.** *Bioinformatics Advances*. 2026; vbag232. https://doi.org/10.1093/bioadv/vbag232
+If this wrapper is used together with CBIcall, please also cite the CBIcall publication:
 
-See also [`CITATION.md`](CITATION.md).
+> Rueda M, Fernandez-Orth D, Gut IG. **CBIcall: a configuration-driven framework for variant calling in large sequencing cohorts.** *Bioinformatics Advances*. 2026. https://doi.org/10.1093/bioadv/vbag232
 
 ---
 
@@ -694,15 +862,13 @@ Repository:
 
 https://github.com/dietmarfdz/cbicall-slurm-wgs-mtdna-orchestrator
 
-This wrapper was developed to support reproducible, failure-aware execution of repeated WGS and mitochondrial CBIcall analyses on Slurm-based HPC infrastructure.
-
 ---
 
 ## Acknowledgements
 
 This repository builds on **CBIcall**, developed by CNAG Biomedical Informatics.
 
-Development of this repository was assisted by **ChatGPT (OpenAI)** for code review, workflow design, debugging and documentation. The workflow logic, adaptation to the target HPC environment, testing and validation were performed by the repository author.
+Development of this repository was assisted by **ChatGPT (OpenAI)** for code review, workflow design, debugging, and documentation. The workflow logic, adaptation to the target HPC environment, testing, and validation were performed by the repository author.
 
 ---
 
@@ -710,7 +876,7 @@ Development of this repository was assisted by **ChatGPT (OpenAI)** for code rev
 
 See [`LICENSE`](LICENSE).
 
-Because this wrapper invokes and is designed around CBIcall, users should also review the license and usage terms of the upstream CBIcall project.
+This wrapper is an independent utility. CBIcall remains a separate project maintained by its own authors and is subject to its own license and usage terms.
 
 ---
 
@@ -718,6 +884,6 @@ Because this wrapper invokes and is designed around CBIcall, users should also r
 
 This repository is provided as a research/HPC automation utility.
 
-Cluster configuration, CBIcall versions, output naming conventions and computational policies differ between environments. Always validate the workflow with a small number of known samples before running a large cohort.
+Cluster configuration, CBIcall versions, output naming conventions, and computational policies differ between environments. Always validate the workflow with a small number of known samples before running a large cohort.
 
-In particular, verify the cleanup behaviour before enabling large-scale execution.
+In particular, verify cleanup behaviour before enabling large-scale execution.
