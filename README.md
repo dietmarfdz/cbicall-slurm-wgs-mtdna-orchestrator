@@ -4,8 +4,6 @@ A lightweight Slurm orchestration layer for running **CBIcall whole-genome seque
 
 This repository does **not** replace or reimplement CBIcall. It is an external Bash/Slurm wrapper designed to automate repeated CBIcall executions on HPC systems.
 
-> **CBIcall** is a configuration-driven framework for reproducible variant calling in large sequencing cohorts.
-
 Official CBIcall resources:
 
 - Repository: https://github.com/CNAG-Biomedical-Informatics/cbicall
