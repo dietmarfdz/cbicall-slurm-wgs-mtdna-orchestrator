@@ -25,10 +25,10 @@ For each sample, the orchestrator:
 5. launches the CBIcall mitochondrial workflow only after WGS validation succeeds;
 6. runs an mtDNA validation/diagnostic step even if the mitochondrial CBIcall job exits unsuccessfully;
 7. characterizes failures compatible with very low mtDNA signal;
-8. removes large WGS BAM intermediates only after mitochondrial analysis has been successfully validated;
+8. removes large WGS BAM intermediates only after successful mitochondrial validation **or** a recognized, explicitly authorized mitochondrial failure with a preserved, validated mtDNA BAM;
 9. records job IDs, timestamps, durations, validation results, and mtDNA diagnostics in a per-sample `pipeline_status.log`.
 
-The main design principle is **fail safe**: cleanup must never be reached after an unsuccessful or unvalidated mitochondrial analysis.
+The main design principle is **conservative cleanup**: a failed MIT analysis does not authorize deletion by itself. A limited set of recognized failure signatures can authorize WGS BAM cleanup after the exported mtDNA BAM has been validated and retained. **The failed mitochondrial analysis remains failed**; cleanup resolves storage handling, not variant-calling results.
 
 ---
 
@@ -65,6 +65,8 @@ The main design principle is **fail safe**: cleanup must never be reached after 
                     | - % chrM covered >=1x
                     | - MIT output / VCF / completion log
                     | - low-mtDNA-signal failure class
+                    | - known MToolBox/GATK errors
+                    | - explicit cleanup authorization
                     v
            success only (afterok)
                     |
@@ -92,7 +94,7 @@ WGS
 
 The `afterany` dependency for `CHECK_MIT` is intentional. It allows the validator to inspect the exported mitochondrial BAM and characterize certain mitochondrial failures instead of leaving only a generic failed Slurm job.
 
-`CLEANUP` still depends on `CHECK_MIT` with `afterok`, so a failed mitochondrial validation **does not delete the WGS BAMs**.
+`CLEANUP` depends on `CHECK_MIT` with `afterok`. `CHECK_MIT` exits successfully either after validating successful MIT output or after explicitly authorizing cleanup for one of the narrowly recognized failure signatures. Unrecognized MIT failures do not authorize deletion.
 
 ---
 
@@ -195,9 +197,9 @@ WGS_PARTITION="XXX"
 SHORT_PARTITION="XXX"
 EXCLUDE_NODES=""
 
-MEM="24G"
-WGS_TIME="20-00:00:00"
-MIT_TIME="10:00:00"
+MEM="MEMORY_LIMIT"
+WGS_TIME="WGS_WALLTIME"
+MIT_TIME="MIT_WALLTIME"
 
 # CBIcall WGS settings
 CBICALL_RESOURCE="cbicall-germline-resources-v1"
@@ -213,7 +215,7 @@ MTDNA_LOW_MAPPED_READS_THRESHOLD="1000"
 MTDNA_LOW_COVERED_1X_PCT_THRESHOLD="50"
 ```
 
-`config/config.env` must remain local and should **not** be committed. The repository `.gitignore` excludes it.
+All values in the configuration are **examples or placeholders**; set suitable resources, partitions, runtime profile, software paths, and limits for your own infrastructure before submitting jobs. `config/config.env` must remain local and should **not** be committed. The repository `.gitignore` excludes it.
 
 A different configuration file can be supplied through:
 
@@ -274,7 +276,7 @@ Arguments:
 3. THREADS        Optional; default = 4
 ```
 
-The orchestrator immediately submits the complete dependency chain. Slurm then controls when each job actually starts.
+The named sample directory must already exist under `WORKDIR_BASE` and contain the input files expected by CBIcall. Sample IDs must use letters, digits, underscores, hyphens, or dots (no `..` sequences). For safe generation of Slurm scripts, the canonical working-directory path must contain only letters, digits, `/`, `_`, `.`, `+`, or `-` (no whitespace or shell metacharacters). The orchestrator immediately submits the complete dependency chain. Slurm then controls when each job actually starts.
 
 ---
 
@@ -308,7 +310,7 @@ For example:
 run_batch_YYYYMMDD_HHMMSS.log
 ```
 
-The log records successful submissions, failed submissions, and orchestrator exit codes.
+The log records successful submissions, failed submissions, and orchestrator exit codes. `run_batch.sh` also records its version and script name in each per-sample status log; direct orchestrator runs use `NOT_PROVIDED` for launcher metadata.
 
 Submitting multiple samples does not mean that all WGS jobs start simultaneously. Slurm schedules them according to resources, priorities, quotas, and cluster policy.
 
@@ -426,106 +428,67 @@ MTDNA_COVERED_1X_PCT
 
 ### Low mtDNA signal classification
 
-A failure is classified as:
-
-```text
-MIT_FAIL_REASON: LOW_MTDNA_SIGNAL
-```
-
-only when **both** conditions are met:
+Low mtDNA signal is diagnosed when **either** mapped-read count or chrM breadth falls below the configured threshold:
 
 ```text
 MTDNA_MAPPED_READS < MTDNA_LOW_MAPPED_READS_THRESHOLD
-AND
+OR
 MTDNA_COVERED_1X_PCT < MTDNA_LOW_COVERED_1X_PCT_THRESHOLD
 ```
 
-With the example configuration:
+With the example settings, this means fewer than 1,000 mapped reads **or** less than 50% of chrM covered at >=1x. The log records `MTDNA_LOW_SIGNAL_TRIGGER` as `LOW_READS`, `LOW_COVERAGE`, `LOW_READS_AND_LOW_COVERAGE`, or `NONE`.
 
-```text
-mapped reads < 1000
-AND
-chrM coverage >=1x < 50%
-```
+These thresholds are **operational diagnostics**, not clinical or biological QC standards.
 
-This is an **operational failure classification used by the orchestrator**, not a biological or clinical QC threshold.
+**Low signal alone does not permit WGS BAM deletion.** If MIT failed, automatic cleanup requires all of the following:
 
-When the low-signal condition is met and the exported BAM, index, and BAM integrity checks are valid, the status log also records:
+1. Low mtDNA signal under at least one criterion.
+2. A valid exported mtDNA BAM, BAM index, `samtools quickcheck`, and usable index.
+3. The known MToolBox log signature `consensus_value ... referenced before assignment`.
+4. `CHECK_MIT` recording `CHECK_MIT_CLEANUP_ALLOWED: LOW_MTDNA_SIGNAL`.
+5. Successful revalidation of the exported mtDNA BAM and index in `CLEANUP`.
 
-```text
-WGS_BAM_CLEANUP_CANDIDATE: YES
-```
+A matching failure is recorded as `MIT_FAIL_REASON: LOW_MTDNA_SIGNAL` with `MIT_FAILURE_SIGNATURE: MTOOLBOX_CONSENSUS_VALUE_ERROR`. If the MIT log is unavailable or the signature does not match, automatic cleanup is **not** authorized.
 
-This flag is informational only. The current orchestrator does **not** automatically delete the WGS BAM when MIT fails.
+### Recognized MToolBox / GATK internal failures
 
-If the mitochondrial log contains the known MToolBox signature:
+Two additional, narrowly defined failure signatures can authorize cleanup of WGS BAM intermediates while retaining the exported mtDNA BAM:
 
-```text
-consensus_value ... referenced before assignment
-```
+| Failure signature | Required evidence in MIT log |
+| --- | --- |
+| `MTOOLBOX_MEDIAN_INDEX_ERROR` | `qs1.append(median(qs2))` and `IndexError: list index out of range` |
+| `GATK_INDELREALIGNER_OUT_OF_ORDER` | `maximum allowable reads in memory is too small` and `Alignments added out of order in SAMFileWriterImpl.addAlignment` |
 
-the checker additionally records:
-
-```text
-MIT_FAILURE_SIGNATURE: MTOOLBOX_CONSENSUS_VALUE_ERROR
-```
+Both are reported as `MIT_FAIL_REASON: MTOOLBOX_INTERNAL_ERROR`. After validating the mtDNA BAM/index, `CHECK_MIT` can record `CHECK_MIT_CLEANUP_ALLOWED: MTOOLBOX_INTERNAL_ERROR`. **This does not repair MToolBox or produce a valid MIT result.** It permits disposal of large WGS BAM intermediates because the exported mtDNA BAM has been preserved for subsequent investigation or rerunning.
 
 ### Successful mitochondrial validation
 
-A normal successful run still requires the expected mitochondrial output, VCF, and completion log:
-
-```text
-MIT_DIR: ...
-MIT_VCF: ...
-MIT_OK
-```
-
-Only a successful `CHECK_MIT` allows the cleanup stage to run.
+A successful MIT analysis requires the expected output directory, `01_mtoolbox/VCF_file.vcf`, and an MIT log containing `All done!!!`. The checker records `MIT_OK` and `CHECK_MIT_CLEANUP_ALLOWED: MIT_OK`.
 
 ---
 
 ## Safe cleanup
 
-WGS BAMs can occupy substantial disk space. Cleanup is therefore deliberately conservative.
+The `CLEANUP` Slurm job has an `afterok` dependency on `CHECK_MIT`. Before deleting any WGS BAM intermediates, cleanup:
 
-`CLEANUP` runs only after:
+1. Reads the **latest execution block** of `pipeline_status.log` and requires `CHECK_MIT_CLEANUP_ALLOWED` to equal `MIT_OK`, `LOW_MTDNA_SIGNAL`, or `MTOOLBOX_INTERNAL_ERROR`.
+2. Finds the WGS output directory and exported mtDNA BAM.
+3. Confirms that the mtDNA BAM and `.bam.bai` index exist.
+4. Reruns `samtools quickcheck` and `samtools idxstats` on the preserved mtDNA BAM to verify BAM integrity and index usability.
 
-```text
-WGS completed
-      +
-CHECK_WGS passed
-      +
-MIT completed successfully
-      +
-CHECK_MIT passed
-```
+Only then does it delete `01_bam/*.bam` and `01_bam/*.bai` from the selected WGS output directory, preserving `exports/mtdna/*_MIT.bam` and its index.
 
-Immediately before deleting WGS BAMs, the cleanup script verifies again that:
+On success, the log contains:
 
 ```text
-exported mtDNA BAM exists
-exported mtDNA BAM index exists
-samtools quickcheck succeeds
-```
-
-Only then are the WGS BAM/BAM-index files removed:
-
-```text
-WGS_OUTPUT/01_bam/*.bam
-WGS_OUTPUT/01_bam/*.bai
-```
-
-The exported mitochondrial files are preserved.
-
-Successful cleanup records:
-
-```text
+CLEANUP_REASON: MIT_OK | LOW_MTDNA_SIGNAL | MTOOLBOX_INTERNAL_ERROR
 CLEANUP_MTDNA_QUICKCHECK: OK
 CLEANUP_MTDNA_PRESERVED: ...
+WGS_BAMS_DELETED: YES
 CLEANUP_OK
 ```
 
-A validation failure should consume additional storage rather than risk deleting a BAM that may still be required.
+**Important:** Do not submit concurrent runs for the same sample directory. The status log and generated job filenames are shared, and the workflow does not provide a per-run isolation/locking mechanism. The summarizer has a partial safeguard against stale log markers, but it is not a substitute for preventing duplicate launches. Validate cleanup with representative test samples before production use.
 
 ---
 
@@ -538,6 +501,10 @@ A successful run contains entries conceptually similar to:
 ```text
 ===== DATE =====
 START SAMPLE: SAMPLE001
+LAUNCHER_VERSION: <launcher-version>
+LAUNCHER_SCRIPT: run_batch.sh
+ORCHESTRATOR_VERSION: <orchestrator-version>
+ORCHESTRATOR_SCRIPT: cbicall_wgs_mtdna_slurm.sh
 THREADS: 4
 
 WGS_JOB: <job-id>
@@ -567,13 +534,17 @@ MTDNA_TOTAL_READS: ...
 MTDNA_MAPPED_READS: ...
 MTDNA_MEAN_DEPTH: ...
 MTDNA_COVERED_1X_PCT: ...
+MTDNA_LOW_SIGNAL_TRIGGER: NONE
 
 MIT_DIR: ...
 MIT_VCF: ...
 MIT_OK
+CHECK_MIT_CLEANUP_ALLOWED: MIT_OK
 
+CLEANUP_REASON: MIT_OK
 CLEANUP_MTDNA_QUICKCHECK: OK
 CLEANUP_MTDNA_PRESERVED: ...
+WGS_BAMS_DELETED: YES
 CLEANUP_OK
 ```
 
@@ -593,31 +564,28 @@ This utility provides a cohort-level view of a batch launched with the orchestra
 
 ### What it does
 
-The script:
+The **summarizer** scans `pipeline_status.log` files under the current directory and reads only the latest execution block for each sample. It queries `squeue` and `sacct` for job states/reasons, reports the five pipeline job IDs, and extracts mtDNA diagnostics, cleanup authorization outcomes, and version provenance.
 
-- recursively finds `pipeline_status.log` files below the current directory;
-- analyzes only the **most recent run** in each status log;
-- retrieves the WGS, CHECK_WGS, MIT, CHECK_MIT, and CLEANUP job IDs;
-- queries `squeue` for currently active/pending jobs and their reasons;
-- falls back to `sacct` for jobs no longer present in the queue;
-- identifies Slurm failures;
-- detects failures already recorded by the orchestrator validation steps;
-- distinguishes `FAIL_MIT_LOW_SIGNAL` from other mitochondrial failures;
-- extracts mtDNA BAM validation results and signal metrics;
-- reports the current stage for samples that are still processing.
+In particular:
+
+- Active WGS Slurm states take precedence over stale downstream markers when deciding whether a sample is `PROCESSING`.
+- Resolved low-signal and recognized internal MToolBox/GATK failures can be reported as `OK` **for the orchestration/storage workflow** when cleanup completed and `WGS_BAMS_DELETED: YES` is present. This **does not imply successful mitochondrial variant calling**.
+- `MTOOLBOX_INTERNAL_ERROR` in the global summary is a diagnostic count and may overlap with `ALL_OK`; it is not an additional unresolved-failure count.
+- Legacy logs without `LAUNCHER_VERSION` or `ORCHESTRATOR_VERSION` show `NA`.
+- A manually added legacy `PIPELINE_FINAL_STATUS: OK_LOW_MTDNA_SIGNAL` is recognized for backward compatibility; the orchestrator does not emit this field automatically.
 
 ### Running the summarizer
 
-Run it from the directory containing the individual sample directories:
+From the directory containing sample directories:
 
 ```bash
 cd /path/to/WORKDIR_BASE
-/path/to/cbicall-slurm-wgs-mtdna-orchestrator/tools/summarize_pipeline_status.sh
+/path/to/repository/tools/summarize_pipeline_status.sh
 ```
 
-### Generated outputs
+Temporary files default to `${TMPDIR:-/tmp}`. Set `CBICALL_SUMMARY_TMPDIR=/path/to/writable/tmp` to override this location.
 
-The summarizer creates:
+### Generated outputs
 
 ```text
 paths_pipeline_status_logs
@@ -625,56 +593,26 @@ pipeline_status_summary.log
 jobs_by_sample.tsv
 ```
 
-#### `pipeline_status_summary.log`
+`pipeline_status_summary.log` contains metadata, global counts, and a per-sample table with `SAMPLE`, `STATUS`, `DETAIL`, `LAUNCHER_VERSION`, `ORCHESTRATOR_VERSION`, and `PIPELINE_STATUS_LOG`.
 
-Provides global counts and one status row per sample.
+Status values include `OK`, `PROCESSING`, `FAIL_WGS`, `FAIL_WGS_CHECK`, `FAIL_MIT`, `FAIL_MIT_CHECK`, `FAIL_MIT_LOW_SIGNAL`, and `FAIL_CLEANUP`.
 
-Possible classifications include:
+`jobs_by_sample.tsv` includes job IDs, Slurm states/reasons, mtDNA metrics, `MTDNA_LOW_SIGNAL_TRIGGER`, `MIT_FAIL_REASON`, `MIT_FAILURE_SIGNATURE`, `WGS_BAM_CLEANUP_CANDIDATE`, `WGS_BAMS_DELETED`, `PIPELINE_FINAL_STATUS`, and launcher/orchestrator/summarizer version metadata.
 
-```text
-OK
-PROCESSING
-FAIL_WGS
-FAIL_WGS_CHECK
-FAIL_MIT
-FAIL_MIT_CHECK
-FAIL_MIT_LOW_SIGNAL
-FAIL_CLEANUP
-```
-
-For samples still running, the detail field may indicate:
-
-```text
-queued_waiting_for_WGS
-running_WGS
-waiting_for_MIT
-running_MIT
-waiting_or_running_CLEANUP
-```
-
-#### `jobs_by_sample.tsv`
-
-Provides a tab-separated table containing:
-
-- sample ID;
-- job IDs for WGS, CHECK_WGS, MIT, CHECK_MIT, and CLEANUP;
-- Slurm state and reason for each job;
-- mtDNA BAM/BAI validation status;
-- BAM quickcheck status;
-- mapped mtDNA reads;
-- mean mtDNA depth;
-- percentage of `chrM` covered at least 1x;
-- MIT failure reason;
-- `WGS_BAM_CLEANUP_CANDIDATE`.
-
-Recommended viewing:
+To view the summary without widening the sample column due to long metadata lines:
 
 ```bash
-column -t -s $'\t' pipeline_status_summary.log | less -S
+{
+    awk '/^SAMPLE\tSTATUS\tDETAIL\t/ {exit} {print}' pipeline_status_summary.log
+    awk 'f || /^SAMPLE\tSTATUS\tDETAIL\t/ {f=1; print}' pipeline_status_summary.log \
+        | column -t -s $'\t' -o ' '
+} | less -S
 ```
 
+To view the TSV:
+
 ```bash
-column -t -s $'\t' jobs_by_sample.tsv | less -S
+column -t -s $'\t' -o ' ' jobs_by_sample.tsv | less -S
 ```
 
 ---
@@ -706,22 +644,7 @@ The mitochondrial workflow is not started and no cleanup occurs.
 
 ### MIT job fails
 
-`CHECK_MIT` still runs because it uses:
-
-```text
-afterany:<MIT_JOB>
-```
-
-The checker attempts to validate the exported mtDNA BAM and characterize the failure.
-
-If the failure is compatible with very low mitochondrial signal, it records:
-
-```text
-MIT_FAIL_REASON: LOW_MTDNA_SIGNAL
-WGS_BAM_CLEANUP_CANDIDATE: YES
-```
-
-`CHECK_MIT` exits unsuccessfully, so cleanup is not executed.
+`CHECK_MIT` still runs because its dependency is `afterany:<MIT_JOB>`. For a confirmed low-mtDNA-signal failure with the recognized MToolBox consensus error, or for one of the two recognized internal software failures, it can explicitly authorize cleanup of WGS BAM intermediates after validating the exported mtDNA BAM/index. Otherwise it exits nonzero and WGS BAMs remain intact. A cleanup-resolved sample may be reported as `OK` by the summarizer **even though MIT variant calling failed**; inspect `MIT_FAIL_REASON` and `MIT_FAILURE_SIGNATURE` for the true outcome.
 
 ### MIT validation fails for another reason
 
@@ -785,7 +708,8 @@ Do not commit:
 - Slurm logs containing sensitive paths or identifiers;
 - credentials, keys, or tokens;
 - private HPC paths;
-- private site-specific configuration.
+- private site-specific configuration;
+- generated Slurm job files, input lists with real sample IDs, and pipeline-generated YAML files.
 
 The repository `.gitignore` excludes common genomic data types, logs, temporary files, credentials, and:
 
@@ -793,12 +717,16 @@ The repository `.gitignore` excludes common genomic data types, logs, temporary 
 config/config.env
 ```
 
-Before every public push, inspect:
+Before every public push, inspect **the staged changes** (not only the working tree):
 
 ```bash
 git status
+git diff --cached --stat
 git diff --cached
+git ls-files
 ```
+
+`.gitignore` reduces the risk of accidental additions, but it cannot remove files already tracked by Git or prevent disclosure of sensitive text pasted into tracked files. Do not publish real sample lists, generated job scripts, status logs, or local configuration. Review commit history as well when changing a repository from private to public.
 
 ---
 
@@ -866,7 +794,7 @@ https://github.com/dietmarfdz/cbicall-slurm-wgs-mtdna-orchestrator
 
 This repository builds on **CBIcall**, developed by CNAG Biomedical Informatics.
 
-Development of this repository was assisted by **ChatGPT (OpenAI)** for code review, workflow design, debugging, and documentation. The workflow logic, adaptation to the target HPC environment, testing, and validation were performed by the repository author.
+Development of this repository was assisted by **ChatGPT (OpenAI)** for code review, workflow design, debugging, and documentation. The author is responsible for the workflow and for validation in any deployment environment.
 
 ---
 
@@ -875,6 +803,18 @@ Development of this repository was assisted by **ChatGPT (OpenAI)** for code rev
 See [`LICENSE`](LICENSE).
 
 This wrapper is an independent utility. CBIcall remains a separate project maintained by its own authors and is subject to its own license and usage terms.
+
+---
+
+## Mock integration tests
+
+A lightweight Bash test suite exercises generated Slurm scripts and the status/cleanup logic using **mocked** `sbatch`, `squeue`, `sacct`, `samtools`, and module loading. It uses temporary dummy BAM files and does **not** run CBIcall or access real genomic data:
+
+```bash
+./tests/test_mock_pipeline.sh
+```
+
+The tests cover normal MIT success, low coverage, low read count, recognized MToolBox/GATK errors, unrecognized MIT failure (no cleanup), active WGS precedence in the summarizer, and version propagation. **Mock tests are not a substitute for validation on the target HPC system.**
 
 ---
 

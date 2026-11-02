@@ -43,3 +43,31 @@ Thumbs.db
 
 # Local/site-specific configuration
 config/config.env
+
+# Summarizer outputs
+paths_pipeline_status_logs
+jobs_by_sample.tsv
+
+# Additional local configuration (keep the example tracked)
+config/*.env
+!config/config.example.env
+config/*.local
+config/*.secret*
+
+# Generated Slurm scripts and CBIcall pipeline parameter files
+job_*_wgs.slurm
+job_*_mit.slurm
+check_wgs.sh
+check_mit.sh
+cleanup.sh
+*_wgs_param.yaml
+*_mit_param.yaml
+
+# Sample lists and metadata must be reviewed before adding them
+sample_list*.txt
+sample-list*.txt
+sample_ids*.txt
+samples*.txt
+
+# Summary file generated alongside the per-sample logs
+pipeline_status_summary.log

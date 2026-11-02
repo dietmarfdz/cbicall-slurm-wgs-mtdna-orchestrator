@@ -6,6 +6,7 @@ set -uo pipefail
 
 ###############################################################################
 # Script: run_batch.sh
+# Batch launcher with version provenance
 #
 # Description:
 #   Reads a text file containing sample IDs and launches the CBIcall
@@ -44,7 +45,7 @@ set -uo pipefail
 #     - orchestrator exit codes.
 ###############################################################################
 
-VERSION="1.0"
+VERSION="1.7"
 
 ###############################################################################
 # Resolve repository paths
@@ -192,7 +193,9 @@ while IFS= read -r SAMPLE || [[ -n "$SAMPLE" ]]; do
     log "Running:"
     log "    $LAUNCHER \"$SAMPLE\" \"$WORKDIR_BASE\" \"$THREADS\""
 
-    if "$LAUNCHER" "$SAMPLE" "$WORKDIR_BASE" "$THREADS" >> "$LOGFILE" 2>&1; then
+    if CBICALL_LAUNCHER_VERSION="$VERSION" \
+       CBICALL_LAUNCHER_SCRIPT="$(basename "$0")" \
+       "$LAUNCHER" "$SAMPLE" "$WORKDIR_BASE" "$THREADS" >> "$LOGFILE" 2>&1; then
         log "OK: $SAMPLE submitted successfully."
         ((OK++))
     else
